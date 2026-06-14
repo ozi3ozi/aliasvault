@@ -46,6 +46,7 @@ import {
     type DeployedCounterContract,
 } from './common-types';
 import { type Config, contractConfig } from './config';
+import { isWalletSynced, resolvePrivateStatePassword } from './sync-utils';
 import { levelPrivateStateProvider } from '@midnight-ntwrk/midnight-js-level-private-state-provider';
 import { assertIsContractAddress, toHex } from '@midnight-ntwrk/midnight-js-utils';
 import { getNetworkId } from '@midnight-ntwrk/midnight-js-network-id';
@@ -186,33 +187,8 @@ const WALLET_SYNC_TIMEOUT_MS = 5 * 60 * 1000;
 // so its wait gets a larger bound than plain sync.
 const DUST_GENERATION_TIMEOUT_MS = 10 * 60 * 1000;
 
-/**
- * Whether one sub-wallet's SyncProgress is "done". `isStrictlyComplete()` requires
- * `isConnected && applied === highest`. On a fresh undeployed devnet, a sub-wallet
- * with no relevant history (e.g. shielded/dust for the genesis wallet) sits at 0/0
- * and may never report `isConnected`, which would hang sync forever — so we also
- * accept the 0/0 "nothing to sync" case. The shielded/dust sub-wallets use v2
- * SyncProgress (`appliedIndex`/`highestRelevantWalletIndex`); unshielded uses v1
- * (`appliedId`/`highestTransactionId`) — so we check both field shapes.
- *
- * CAVEAT: the 0/0 path intentionally ignores `isConnected`. On a network with real
- * history this could in principle resolve on a pre-sync 0/0 snapshot; in the CLI
- * flows the `balance > 0n` filter in waitForFunds/waitForDust is the funded-read
- * backstop. Re-verify these gates against a funded preview/preprod wallet before
- * relying on them for any non-local deploy. (See story 6.5c review issue #3.)
- */
-const isProgressSynced = (progress: any): boolean => {
-    if (progress.isStrictlyComplete()) return true;
-    const applied = progress.appliedIndex ?? progress.appliedId;
-    const target = progress.highestRelevantWalletIndex ?? progress.highestTransactionId;
-    return applied === 0n && target === 0n;
-};
-
-/** 0/0-aware equivalent of FacadeState.isSynced across all three sub-wallets. */
-const isWalletSynced = (state: any): boolean =>
-    isProgressSynced(state.shielded.state.progress) &&
-    isProgressSynced(state.dust.state.progress) &&
-    isProgressSynced(state.unshielded.progress);
+// isWalletSynced (0/0-aware sync check) + resolvePrivateStatePassword live in
+// ./sync-utils as pure, unit-tested helpers (see src/test/sync-utils.test.ts).
 
 /**
  * Resolve once the wallet reports synced, bounded by a timeout so a stuck sync fails
@@ -373,16 +349,10 @@ const registerForDustGeneration = async (
         await wallet.submitTransaction(finalized);
     });
 
-    // Wait for dust to actually generate (balance > 0), not just for coins to appear
-    await withStatus('Waiting for dust tokens to generate', () =>
-        Rx.firstValueFrom(
-            wallet.state().pipe(
-                Rx.throttleTime(5_000),
-                Rx.filter((s) => isWalletSynced(s)),
-                Rx.filter((s) => s.dust.balance(new Date()) > 0n),
-            ),
-        ),
-    );
+    // Wait for dust to actually generate (balance > 0), not just for coins to appear.
+    // Uses the bounded helper (DUST_GENERATION_TIMEOUT_MS) so a stalled infra fails
+    // fast instead of hanging until vitest's beforeAll timeout.
+    await withStatus('Waiting for dust tokens to generate', () => waitForDust(wallet));
 };
 
 /**
@@ -518,29 +488,22 @@ export const buildFreshWallet = async (config: Config): Promise<WalletContext> =
 // public key hex) and `privateStoragePasswordProvider` (returns a password ≥16 chars
 // used to encrypt the level-db store). For CLI/dev flows we default to a fixed
 // password; production callers can override with `MIDNIGHT_PRIVATE_STATE_PASSWORD`.
-// v4 levelPrivateStateProvider enforces password complexity: must contain at least
-// 3 of {uppercase, lowercase, digit, special} and be >= 16 chars. This dev default
-// satisfies all four; production overrides via MIDNIGHT_PRIVATE_STATE_PASSWORD.
+// v4 levelPrivateStateProvider enforces password complexity at provider-build time —
+// ALL of: (1) length >= 16; (2) >= 3 of {uppercase, lowercase, digit, special};
+// (3) no char repeated more than 3 times; (4) no long ascending run; (5) no long
+// descending run. (So e.g. `Password1234!!!` passes rules 1-2 but is rejected by 3/4.)
+// This dev default satisfies all five; production overrides via MIDNIGHT_PRIVATE_STATE_PASSWORD.
 const DEV_PRIVATE_STATE_PASSWORD = 'AliasVault-CLI-Dev-Password-DoNotUseInProduction-1';
 
 export const buildPrivateStateProviderConfig = (walletProvider: WalletProvider, privateStateStoreName: string) => ({
     privateStateStoreName,
     accountId: walletProvider.getCoinPublicKey(),
-    privateStoragePasswordProvider: async (): Promise<string> => {
-        const envPassword = process.env.MIDNIGHT_PRIVATE_STATE_PASSWORD;
-        if (envPassword) return envPassword;
-        // The level-db private-state store encrypts contract secret keys at rest. The
-        // built-in dev default is only acceptable on the local `undeployed` network —
-        // refuse to silently protect any real network's data with it.
-        if (String(getNetworkId()) !== 'undeployed') {
-            throw new Error(
-                'MIDNIGHT_PRIVATE_STATE_PASSWORD must be set for non-local networks: the ' +
-                    'private-state store encrypts contract secret keys at rest and the built-in ' +
-                    'dev default must not protect production data.',
-            );
-        }
-        return DEV_PRIVATE_STATE_PASSWORD;
-    },
+    privateStoragePasswordProvider: async (): Promise<string> =>
+        resolvePrivateStatePassword(
+            String(getNetworkId()),
+            process.env.MIDNIGHT_PRIVATE_STATE_PASSWORD,
+            DEV_PRIVATE_STATE_PASSWORD,
+        ),
 });
 
 /**
